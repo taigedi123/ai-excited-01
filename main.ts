@@ -1,403 +1,300 @@
-// ai-excited-01 — a program that draws ONE image made to get an AI judge excited.
-// Node 22, standard library only, no network. Everything is drawn procedurally at
-// runtime, deterministically: running it twice writes byte-identical PNG bytes.
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { deflateSync } from 'node:zlib';
+// Koi to the Moon — a procedural 1024x1024 PNG, drawn pixel by pixel.
+// No dependencies, no network: Node standard library only (fs, zlib).
+// Deterministic: every random choice comes from a seeded generator.
 
-const W = 1024;
-const H = 1024;
-const SS = 2; // supersampling factor for smooth edges
-const SW = W * SS;
-const SH = H * SS;
+import { writeFileSync, mkdirSync } from "node:fs";
+import { deflateSync } from "node:zlib";
 
-// Float RGB buffer, values 0..1. The background is painted opaque first, so every
-// later draw is a blend-over or an additive glow onto it.
-const px = new Float32Array(SW * SH * 3);
-
-type RGB = [number, number, number];
-
+// ---------------------------------------------------------------------------
+// Seeded random (mulberry32) — same seed, same picture, every run.
+// ---------------------------------------------------------------------------
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+const rand = mulberry32(20261116);
 
-const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
+// ---------------------------------------------------------------------------
+// Canvas: 2x supersampled float RGB buffer, downsampled at the end.
+// ---------------------------------------------------------------------------
+const W = 1024, H = 1024, SS = 2, SW = W * SS, SH = H * SS;
+const buf = new Float32Array(SW * SH * 3);
 
-function hex(h: string): RGB {
-  const n = parseInt(h.slice(1), 16);
-  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+type RGB = [number, number, number];
+
+function clamp01(v: number): number { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+function setPx(x: number, y: number, r: number, g: number, b: number): void {
+  if (x < 0 || y < 0 || x >= SW || y >= SH) return;
+  const i = (y * SW + x) * 3;
+  buf[i] = r; buf[i + 1] = g; buf[i + 2] = b;
 }
 
-function mix(a: RGB, b: RGB, t: number): RGB {
-  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+function addPx(x: number, y: number, r: number, g: number, b: number): void {
+  if (x < 0 || y < 0 || x >= SW || y >= SH) return;
+  const i = (y * SW + x) * 3;
+  buf[i] = Math.min(1, buf[i] + r);
+  buf[i + 1] = Math.min(1, buf[i + 1] + g);
+  buf[i + 2] = Math.min(1, buf[i + 2] + b);
 }
 
-// Multi-stop gradient: stops are [position 0..1, colour].
-function grad(stops: [number, RGB][], t: number): RGB {
+// Blend a colour over the pixel with alpha a (0..1).
+function blendPx(x: number, y: number, r: number, g: number, b: number, a: number): void {
+  if (x < 0 || y < 0 || x >= SW || y >= SH || a <= 0) return;
+  if (a >= 1) { setPx(x, y, r, g, b); return; }
+  const i = (y * SW + x) * 3;
+  buf[i] = buf[i] * (1 - a) + r * a;
+  buf[i + 1] = buf[i + 1] * (1 - a) + g * a;
+  buf[i + 2] = buf[i + 2] * (1 - a) + b * a;
+}
+
+// ---------------------------------------------------------------------------
+// Gradients
+// ---------------------------------------------------------------------------
+interface Stop { t: number; c: RGB; }
+function lerpStops(stops: Stop[], t: number): RGB {
   t = clamp01(t);
-  for (let i = 0; i < stops.length - 1; i++) {
-    const [p0, c0] = stops[i];
-    const [p1, c1] = stops[i + 1];
-    if (t <= p1) return mix(c0, c1, p1 === p0 ? 0 : (t - p0) / (p1 - p0));
+  if (t <= stops[0].t) return stops[0].c;
+  for (let s = 1; s < stops.length; s++) {
+    if (t <= stops[s].t) {
+      const a = stops[s - 1], b = stops[s];
+      const f = (t - a.t) / (b.t - a.t);
+      return [
+        a.c[0] + (b.c[0] - a.c[0]) * f,
+        a.c[1] + (b.c[1] - a.c[1]) * f,
+        a.c[2] + (b.c[2] - a.c[2]) * f,
+      ];
+    }
   }
-  return stops[stops.length - 1][1];
+  return stops[stops.length - 1].c;
 }
 
-// --- pixel ops (coordinates are in supersampled space) ----------------------
-function blend(x: number, y: number, c: RGB, a: number): void {
-  const xi = x | 0;
-  const yi = y | 0;
-  if (xi < 0 || yi < 0 || xi >= SW || yi >= SH || a <= 0) return;
-  const i = (yi * SW + xi) * 3;
-  px[i] = c[0] * a + px[i] * (1 - a);
-  px[i + 1] = c[1] * a + px[i + 1] * (1 - a);
-  px[i + 2] = c[2] * a + px[i + 2] * (1 - a);
-}
-
-function add(x: number, y: number, c: RGB, a: number): void {
-  const xi = x | 0;
-  const yi = y | 0;
-  if (xi < 0 || yi < 0 || xi >= SW || yi >= SH || a <= 0) return;
-  const i = (yi * SW + xi) * 3;
-  px[i] += c[0] * a;
-  px[i + 1] += c[1] * a;
-  px[i + 2] += c[2] * a;
-}
-
-// --- fills (coordinates are in logical 1024 space) --------------------------
-function fillRect(x0: number, y0: number, x1: number, y1: number, c: RGB, a = 1): void {
-  const X0 = Math.max(0, Math.floor(x0 * SS));
-  const X1 = Math.min(SW, Math.ceil(x1 * SS));
-  const Y0 = Math.max(0, Math.floor(y0 * SS));
-  const Y1 = Math.min(SH, Math.ceil(y1 * SS));
-  for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) blend(x, y, c, a);
-}
-
-// Vertical gradient over a rectangle.
-function vgrad(x0: number, y0: number, x1: number, y1: number, stops: [number, RGB][]): void {
-  const Y0 = Math.max(0, Math.floor(y0 * SS));
-  const Y1 = Math.min(SH, Math.ceil(y1 * SS));
-  for (let y = Y0; y < Y1; y++) {
-    const c = grad(stops, (y / SS - y0) / (y1 - y0));
-    fillRect(x0, y / SS, x1, y / SS + 1 / SS + 0.01, c, 1);
+function fillVerticalGradient(stops: Stop[], y0: number, y1: number): void {
+  for (let y = 0; y < SH; y++) {
+    const c = lerpStops(stops, (y - y0) / (y1 - y0));
+    for (let x = 0; x < SW; x++) setPx(x, y, c[0], c[1], c[2]);
   }
 }
 
-// Soft additive radial glow. peak is the added brightness at the centre.
-function glow(cx: number, cy: number, r: number, c: RGB, peak: number, falloff = 2): void {
-  const R = Math.ceil(r * SS);
-  const CX = cx * SS;
-  const CY = cy * SS;
-  const X0 = Math.max(0, Math.floor(CX - R));
-  const X1 = Math.min(SW, Math.ceil(CX + R));
-  const Y0 = Math.max(0, Math.floor(CY - R));
-  const Y1 = Math.min(SH, Math.ceil(CY + R));
-  for (let y = Y0; y < Y1; y++) {
-    for (let x = X0; x < X1; x++) {
-      const d = Math.hypot(x - CX, y - CY) / R;
+// ---------------------------------------------------------------------------
+// Shapes
+// ---------------------------------------------------------------------------
+// Soft filled disc: radius in supersampled px, edge feather in px.
+function disc(cx: number, cy: number, r: number, c: RGB, a = 1, feather = 1.5): void {
+  const x0 = Math.max(0, Math.floor(cx - r - feather));
+  const x1 = Math.min(SW - 1, Math.ceil(cx + r + feather));
+  const y0 = Math.max(0, Math.floor(cy - r - feather));
+  const y1 = Math.min(SH - 1, Math.ceil(cy + r + feather));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
+      if (d >= r + feather) continue;
+      const alpha = a * (d <= r ? 1 : 1 - (d - r) / feather);
+      blendPx(x, y, c[0], c[1], c[2], alpha);
+    }
+  }
+}
+
+// Additive radial glow: brightness falls off smoothly from the centre.
+function glow(cx: number, cy: number, r: number, c: RGB, strength: number): void {
+  const x0 = Math.max(0, Math.floor(cx - r));
+  const x1 = Math.min(SW - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r));
+  const y1 = Math.min(SH - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy) / r;
       if (d >= 1) continue;
-      add(x, y, c, peak * Math.pow(1 - d, falloff));
+      const f = strength * (1 - d) * (1 - d) * (1 + 2 * d * d);
+      addPx(x, y, c[0] * f, c[1] * f, c[2] * f);
     }
   }
 }
 
-// Filled disc. soft>0 feathers the edge over that many logical pixels.
-function disc(cx: number, cy: number, r: number, c: RGB, a = 1, soft = 0): void {
-  const R = (r + soft) * SS;
-  const CX = cx * SS;
-  const CY = cy * SS;
-  const X0 = Math.max(0, Math.floor(CX - R));
-  const X1 = Math.min(SW, Math.ceil(CX + R));
-  const Y0 = Math.max(0, Math.floor(CY - R));
-  const Y1 = Math.min(SH, Math.ceil(CY + R));
-  for (let y = Y0; y < Y1; y++) {
-    for (let x = X0; x < X1; x++) {
-      const d = Math.hypot(x - CX, y - CY) / SS;
-      let al = 0;
-      if (soft > 0) al = a * clamp01((r - d) / soft + 0.5);
-      else if (d <= r) al = a;
-      if (al > 0) blend(x, y, c, al);
-    }
-  }
-}
-
-// Scanline polygon fill.
-function poly(pts: [number, number][], c: RGB, a = 1): void {
-  const P = pts.map(([x, y]): [number, number] => [x * SS, y * SS]);
-  let minY = Infinity;
-  let maxY = -Infinity;
-  for (const [, y] of P) {
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y);
-  }
-  for (let y = Math.max(0, Math.floor(minY)); y < Math.min(SH, Math.ceil(maxY)); y++) {
+// Scanline polygon fill (points in supersampled coords).
+function polygon(pts: Array<[number, number]>, c: RGB, a = 1): void {
+  if (pts.length < 3) return;
+  let minY = Infinity, maxY = -Infinity;
+  for (const [, y] of pts) { minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+  const y0 = Math.max(0, Math.floor(minY)), y1 = Math.min(SH - 1, Math.ceil(maxY));
+  for (let y = y0; y <= y1; y++) {
+    const yc = y + 0.5;
     const xs: number[] = [];
-    for (let i = 0; i < P.length; i++) {
-      const [x0, y0] = P[i];
-      const [x1, y1] = P[(i + 1) % P.length];
-      if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
-        xs.push(x0 + ((y - y0) / (y1 - y0)) * (x1 - x0));
+    for (let i = 0; i < pts.length; i++) {
+      const [x1, y1p] = pts[i], [x2, y2p] = pts[(i + 1) % pts.length];
+      if ((y1p <= yc && y2p > yc) || (y2p <= yc && y1p > yc)) {
+        xs.push(x1 + (yc - y1p) * (x2 - x1) / (y2p - y1p));
       }
     }
-    xs.sort((a, b) => a - b);
+    xs.sort((p, q) => p - q);
     for (let k = 0; k + 1 < xs.length; k += 2) {
-      const X0 = Math.max(0, Math.floor(xs[k]));
-      const X1 = Math.min(SW, Math.ceil(xs[k + 1]));
-      for (let x = X0; x < X1; x++) blend(x, y, c, a);
+      const xa = Math.max(0, Math.ceil(xs[k])), xb = Math.min(SW - 1, Math.floor(xs[k + 1]));
+      for (let x = xa; x <= xb; x++) blendPx(x, y, c[0], c[1], c[2], a);
     }
   }
 }
 
-function segDist(px0: number, py0: number, x0: number, y0: number, x1: number, y1: number): number {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len2 = dx * dx + dy * dy;
-  let t = len2 === 0 ? 0 : ((px0 - x0) * dx + (py0 - y0) * dy) / len2;
-  t = t < 0 ? 0 : t > 1 ? 1 : t;
-  return Math.hypot(px0 - (x0 + t * dx), py0 - (y0 + t * dy));
-}
-
-// Thick polyline with round caps/joins (constant width).
-function stroke(pts: [number, number][], width: number, c: RGB, a = 1): void {
-  const r = (width / 2) * SS;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const [x0, y0] = pts[i];
-    const [x1, y1] = pts[i + 1];
-    const X0 = Math.max(0, Math.floor(Math.min(x0, x1) * SS - r - 1));
-    const X1 = Math.min(SW, Math.ceil(Math.max(x0, x1) * SS + r + 1));
-    const Y0 = Math.max(0, Math.floor(Math.min(y0, y1) * SS - r - 1));
-    const Y1 = Math.min(SH, Math.ceil(Math.max(y0, y1) * SS + r + 1));
-    for (let y = Y0; y < Y1; y++) {
-      for (let x = X0; x < X1; x++) {
-        if (segDist(x, y, x0 * SS, y0 * SS, x1 * SS, y1 * SS) <= r) blend(x, y, c, a);
-      }
+// Thick polyline: stamps discs along the path.
+function thickLine(pts: Array<[number, number]>, width: number, c: RGB, a = 1): void {
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    const steps = Math.max(1, Math.ceil(len / (width * 0.4)));
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      disc(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, width / 2, c, a, 1.2);
     }
   }
 }
 
-
-function cubic(p0: [number, number], p1: [number, number], p2: [number, number], p3: [number, number], n = 32): [number, number][] {
-  const out: [number, number][] = [];
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = 1 - t;
-    out.push([
-      u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
-      u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1],
-    ]);
-  }
-  return out;
+// Cubic bezier point.
+function bezier(p0: [number, number], p1: [number, number], p2: [number, number], p3: [number, number], t: number): [number, number] {
+  const u = 1 - t;
+  return [
+    u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+    u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1],
+  ];
 }
 
-function quad(p0: [number, number], p1: [number, number], p2: [number, number], n = 20): [number, number][] {
-  const out: [number, number][] = [];
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = 1 - t;
-    out.push([u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0], u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]]);
-  }
-  return out;
-}
-
-// Elongated pointed shape (feather / fin / flame tongue) from base to tip.
-function leaf(x0: number, y0: number, x1: number, y1: number, w: number, c: RGB, a = 1): void {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len = Math.hypot(dx, dy) || 1;
-  const nx = -dy / len;
-  const ny = dx / len;
-  const mx = x0 + dx * 0.45;
-  const my = y0 + dy * 0.45;
-  poly(
-    [
-      [x0, y0],
-      [mx + nx * w, my + ny * w],
-      [x1, y1],
-      [mx - nx * w, my - ny * w],
-    ],
-    c,
-    a,
-  );
-}
-
-// Four-point sparkle star.
-function sparkle(cx: number, cy: number, r: number, c: RGB, a = 1): void {
-  const pts: [number, number][] = [];
-  for (let i = 0; i < 8; i++) {
-    const ang = (i * Math.PI) / 4;
-    const rr = i % 2 === 0 ? r : r * 0.16;
-    pts.push([cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr]);
-  }
-  poly(pts, c, a);
-  glow(cx, cy, r * 2.4, c, 0.3 * a);
-}
-
-// --- tiny 5x7 bitmap font (each glyph: 7 rows of 5 bits, bit 4 = leftmost) ----
+// ---------------------------------------------------------------------------
+// Tiny 5x7 bitmap font — only the glyphs we need (plus a few extras).
+// Each row is a 5-bit mask, top row first.
+// ---------------------------------------------------------------------------
 const FONT: Record<string, number[]> = {
-  A: [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
-  B: [0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e],
-  C: [0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e],
-  D: [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e],
-  E: [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
-  F: [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10],
-  G: [0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f],
-  H: [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
-  I: [0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e],
-  J: [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c],
-  K: [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
-  L: [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
-  M: [0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11],
-  N: [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
-  O: [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
-  P: [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
-  Q: [0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d],
-  R: [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11],
-  S: [0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e],
-  T: [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-  U: [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
-  V: [0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04],
-  W: [0x11, 0x11, 0x11, 0x15, 0x15, 0x1b, 0x11],
-  X: [0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11],
-  Y: [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04],
-  Z: [0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f],
-  '0': [0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e],
-  '1': [0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e],
-  '2': [0x0e, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1f],
-  '3': [0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e],
-  '4': [0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02],
-  '5': [0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e],
-  '6': [0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e],
-  '7': [0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-  '8': [0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e],
-  '9': [0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c],
-  ' ': [0, 0, 0, 0, 0, 0, 0],
-  '!': [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04],
-  '.': [0, 0, 0, 0, 0, 0x0c, 0x0c],
-  '-': [0, 0, 0, 0x0e, 0, 0, 0],
-  "'": [0x04, 0x04, 0x08, 0, 0, 0, 0],
+  "T": [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+  "O": [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+  "H": [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+  "E": [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+  "M": [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+  "N": [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+  " ": [0, 0, 0, 0, 0, 0, 0],
+  "!": [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100],
+  ".": [0, 0, 0, 0, 0, 0, 0b00100],
 };
 
-function drawText(str: string, x: number, y: number, s: number, c: RGB, a = 1): void {
-  let cx = x;
-  for (const ch of str.toUpperCase()) {
-    const g = FONT[ch] ?? FONT[' '];
+// Draw text centred at (cx, cy) in final-pixel coords; scale = px per font unit.
+function drawText(text: string, cx: number, cy: number, scale: number, c: RGB, a = 1): void {
+  const unit = 6; // 5 wide + 1 gap
+  const totalW = text.length * unit * scale - scale;
+  let x = (cx - totalW / 2) * SS;
+  const yTop = (cy - 3.5 * scale) * SS;
+  const s = scale * SS;
+  for (const ch of text) {
+    const glyph = FONT[ch] ?? FONT[" "];
     for (let row = 0; row < 7; row++) {
       for (let col = 0; col < 5; col++) {
-        if ((g[row] >> (4 - col)) & 1) {
-          fillRect(cx + col * s, y + row * s, cx + (col + 1) * s, y + (row + 1) * s, c, a);
+        if ((glyph[row] >> (4 - col)) & 1) {
+          const rx = Math.round(x + col * s), ry = Math.round(yTop + row * s);
+          for (let yy = ry; yy < ry + s; yy++)
+            for (let xx = rx; xx < rx + s; xx++) blendPx(xx, yy, c[0], c[1], c[2], a);
         }
       }
     }
-    cx += 6 * s;
+    x += unit * s;
   }
 }
 
-function textWidth(str: string, s: number): number {
-  return str.length * 6 * s - s;
+// ---------------------------------------------------------------------------
+// PNG encoder: CRC32, IHDR/IDAT/IEND, zlib deflate level 9, best filter/row.
+// ---------------------------------------------------------------------------
+const CRC_TABLE = new Int32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  CRC_TABLE[n] = c;
 }
-
-// --- PNG encoding (pure Node: zlib deflate, per-row best filter) --------------
-const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-
-function crc32(buf: Buffer): number {
+function crc32(data: Buffer): number {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 255] ^ (c >>> 8);
+  for (let i = 0; i < data.length; i++) c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-
-function pngChunk(type: string, data: Buffer): Buffer {
+function chunk(type: string, data: Buffer): Buffer {
   const out = Buffer.alloc(12 + data.length);
   out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, 'ascii');
+  out.write(type, 4, "ascii");
   data.copy(out, 8);
-  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, 'ascii'), data])), 8 + data.length);
+  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, "ascii"), data])), 8 + data.length);
   return out;
 }
-
-function encodePNG(rgb: Uint8Array, w: number, h: number): Buffer {
-  const stride = w * 3;
-  const raw = Buffer.alloc((stride + 1) * h);
-  for (let y = 0; y < h; y++) {
-    const row = rgb.subarray(y * stride, (y + 1) * stride);
-    const prev = y > 0 ? rgb.subarray((y - 1) * stride, y * stride) : null;
-    let bestF = 0;
-    let bestScore = Infinity;
-    let best: Buffer | null = null;
-    for (let f = 0; f < 5; f++) {
-      const out = Buffer.alloc(stride);
-      let score = 0;
-      for (let i = 0; i < stride; i++) {
-        let v = row[i];
-        if (f === 1) v = (v - (i >= 3 ? row[i - 3] : 0)) & 255;
-        else if (f === 2) v = (v - (prev ? prev[i] : 0)) & 255;
-        else if (f === 3) v = (v - (((i >= 3 ? row[i - 3] : 0) + (prev ? prev[i] : 0)) >> 1)) & 255;
-        else if (f === 4) {
-          const a = i >= 3 ? row[i - 3] : 0;
-          const b = prev ? prev[i] : 0;
-          const cc = i >= 3 && prev ? prev[i - 3] : 0;
-          const p = a + b - cc;
-          const pa = Math.abs(p - a);
-          const pb = Math.abs(p - b);
-          const pc = Math.abs(p - cc);
-          const pr = pa <= pb && pa <= pc ? a : pb <= pc ? b : cc;
-          v = (v - pr) & 255;
-        }
-        out[i] = v;
-        score += v < 128 ? v : 256 - v;
-      }
-      if (score < bestScore) {
-        bestScore = score;
-        bestF = f;
-        best = out;
-      }
+function paeth(a: number, b: number, c: number): number {
+  const p = a + b - c;
+  const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+}
+// Pick the best of the 5 PNG filters for one row by sum of |signed byte|.
+function filterRow(row: Buffer, prev: Buffer | null, bpp: number): Buffer {
+  const w = row.length;
+  const cands: Buffer[] = [];
+  for (let f = 0; f < 5; f++) {
+    const out = Buffer.alloc(w + 1);
+    out[0] = f;
+    for (let i = 0; i < w; i++) {
+      const x = row[i];
+      const a = i >= bpp ? row[i - bpp] : 0;
+      const b = prev ? prev[i] : 0;
+      const cc = prev && i >= bpp ? prev[i - bpp] : 0;
+      let pred = 0;
+      if (f === 1) pred = a;
+      else if (f === 2) pred = b;
+      else if (f === 3) pred = Math.floor((a + b) / 2);
+      else if (f === 4) pred = paeth(a, b, cc);
+      out[i + 1] = (x - pred) & 0xff;
     }
-    raw[y * (stride + 1)] = bestF;
-    best!.copy(raw, y * (stride + 1) + 1);
+    cands.push(out);
   }
-  const idat = deflateSync(raw, { level: 9 });
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(w, 0);
-  ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type RGB
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  return Buffer.concat([sig, pngChunk('IHDR', ihdr), pngChunk('IDAT', idat), pngChunk('IEND', Buffer.alloc(0))]);
+  let best = cands[0], bestScore = Infinity;
+  for (const cand of cands) {
+    let score = 0;
+    for (let i = 1; i < cand.length; i++) {
+      const v = cand[i] >= 128 ? cand[i] - 256 : cand[i];
+      score += Math.abs(v);
+    }
+    if (score < bestScore) { bestScore = score; best = cand; }
+  }
+  return best;
 }
 
-// Average the supersampled buffer down to 1024x1024 RGB bytes.
-function downsample(): Uint8Array {
-  const out = new Uint8Array(W * H * 3);
+function encodePNG(rgb: Buffer, width: number, height: number): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const bpp = 3;
+  const rows: Buffer[] = [];
+  let prev: Buffer | null = null;
+  for (let y = 0; y < height; y++) {
+    const row = rgb.subarray(y * width * bpp, (y + 1) * width * bpp);
+    const filtered = filterRow(row, prev, bpp);
+    rows.push(filtered);
+    prev = row;
+  }
+  const idat = deflateSync(Buffer.concat(rows), { level: 9 });
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// Downsample the 2x buffer to 1024x1024 RGB bytes (box average).
+function downsample(): Buffer {
+  const out = Buffer.alloc(W * H * 3);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      let r = 0;
-      let g = 0;
-      let b = 0;
+      let r = 0, g = 0, b = 0;
       for (let dy = 0; dy < SS; dy++) {
         for (let dx = 0; dx < SS; dx++) {
           const i = ((y * SS + dy) * SW + x * SS + dx) * 3;
-          r += px[i];
-          g += px[i + 1];
-          b += px[i + 2];
+          r += buf[i]; g += buf[i + 1]; b += buf[i + 2];
         }
       }
-      const n = SS * SS;
-      const o = (y * W + x) * 3;
+      const o = (y * W + x) * 3, n = SS * SS;
       out[o] = Math.round(clamp01(r / n) * 255);
       out[o + 1] = Math.round(clamp01(g / n) * 255);
       out[o + 2] = Math.round(clamp01(b / n) * 255);
@@ -406,220 +303,276 @@ function downsample(): Uint8Array {
   return out;
 }
 
-// --- SCENE B: a giant koi leaps for the moon; its splash becomes stars -------
-function drawKoi(): void {
-  const rnd = mulberry32(77);
+// ---------------------------------------------------------------------------
+// Scene: midnight sea, giant moon, leaping koi, spray turning to stars.
+// All coordinates below are in FINAL pixels (x SS to get buffer coords).
+// ---------------------------------------------------------------------------
+const S = (v: number): number => v * SS; // final px -> supersampled px
+const HORIZON = 700; // where sea meets sky, in final px
 
-  // Night sky over the sea.
-  vgrad(0, 0, W, 720, [
-    [0, hex('#010512')],
-    [0.45, hex('#05233d')],
-    [0.8, hex('#0a4a5e')],
-    [1, hex('#0f6a72')],
-  ]);
-  fillRect(0, 720, W, H, hex('#03202e'));
-
-  // Stars, dense and varied; a few bright ones sparkle.
-  for (let i = 0; i < 260; i++) {
-    const x = rnd() * W;
-    const y = rnd() * 660;
-    const r = 0.6 + rnd() * 1.7;
-    const b = 0.4 + rnd() * 0.6;
-    disc(x, y, r, [b, b * 0.98, b], 0.95);
-    if (rnd() < 0.05) sparkle(x, y, 3 + rnd() * 4, hex('#ffffff'), 0.85);
-  }
-  // A small constellation, top-left.
-  const cons: [number, number][] = [
-    [120, 90],
-    [168, 118],
-    [205, 96],
-    [248, 130],
-    [290, 104],
-  ];
-  stroke(cons, 1.4, hex('#9fd8ff'), 0.6);
-  cons.forEach(([cx, cy]) => sparkle(cx, cy, 3.5, hex('#cfeaff'), 0.9));
-
-  // The moon: halo, disc, craters.
-  glow(770, 215, 260, hex('#ffe9a8'), 0.55);
-  glow(770, 215, 150, hex('#fff3c4'), 0.7);
-  disc(770, 215, 108, hex('#fff6d8'), 1, 4);
-  disc(740, 185, 18, hex('#ecd9a8'), 0.5, 6);
-  disc(800, 250, 24, hex('#ecd9a8'), 0.45, 8);
-  disc(790, 175, 12, hex('#ecd9a8'), 0.4, 5);
-  disc(735, 245, 9, hex('#ecd9a8'), 0.4, 4);
-
-  // Moonlight path on the water: shimmering gold dashes under the moon.
-  for (let i = 0; i < 130; i++) {
-    const mx = 770 + (rnd() - 0.5) * (40 + (rnd() * 260));
-    const my = 730 + rnd() * 280;
-    const mw = 8 + rnd() * 42;
-    fillRect(mx - mw / 2, my, mx + mw / 2, my + 2.5, hex('#ffd27a'), 0.16 + rnd() * 0.3);
-  }
-
-  // Rolling waves: long arcs of lighter teal, each row with its own swell and gaps.
-  for (let w = 0; w < 14; w++) {
-    const wy = 742 + w * 20 + rnd() * 8;
-    const phase = rnd() * Math.PI * 2;
-    const amp = 5 + rnd() * 8;
-    const pts: [number, number][] = [];
-    for (let x = -20; x <= W + 20; x += 40) {
-      pts.push([x, wy + Math.sin((x / W) * Math.PI * 2 + phase) * amp]);
-    }
-    // Draw in broken runs so the sea is not a set of perfect rails.
-    let run: [number, number][] = [];
-    for (const p of pts) {
-      run.push(p);
-      if (rnd() < 0.14 && run.length > 2) {
-        stroke(run, 2.5, hex('#0f6a72'), 0.5);
-        run = [];
-      }
-    }
-    if (run.length > 1) stroke(run, 2.5, hex('#0f6a72'), 0.5);
-    stroke(pts, 1.2, hex('#7ad0ff'), 0.16);
-  }
-
-  // The koi's spine: a leap from the water at lower-left to the moon at upper-right.
-  const spine = cubic([290, 830], [420, 600], [540, 430], [690, 330], 40);
-  const radiusAt = (t: number): number => 12 + Math.sin(Math.min(t * 1.25, 1) * Math.PI) * 40;
-
-  // Tail fin first (behind the body): three big flowing translucent leaves.
-  const tailBase = spine[0];
-  leaf(tailBase[0] - 6, tailBase[1] + 4, tailBase[0] - 150, tailBase[1] + 180, 40, hex('#ff5a1f'), 0.92);
-  leaf(tailBase[0] + 4, tailBase[1] - 2, tailBase[0] - 80, tailBase[1] + 225, 32, hex('#ff9a2a'), 0.92);
-  leaf(tailBase[0] + 10, tailBase[1] + 8, tailBase[0] - 185, tailBase[1] + 110, 28, hex('#ffc93c'), 0.85);
-  leaf(tailBase[0] - 2, tailBase[1] + 12, tailBase[0] - 120, tailBase[1] + 250, 20, hex('#ffe14d'), 0.8);
-  glow(tailBase[0] - 90, tailBase[1] + 150, 90, hex('#ff7a1a'), 0.25);
-
-  // Body: overlapping discs along the spine, one smooth orange; a soft darker
-  // shade underneath gives it volume instead of stripes.
-  const orange = hex('#ff7a1a');
-  const deep = hex('#e2480f');
-  spine.forEach(([bx, by], i) => {
-    const t = i / (spine.length - 1);
-    const r = radiusAt(t);
-    disc(bx, by, r, mix(orange, deep, 0.12 * Math.sin(i * 0.9) + 0.12), 0.98);
-  });
-  // Belly shade along the lower edge.
-  spine.forEach(([bx, by], i) => {
-    const t = i / (spine.length - 1);
-    const r = radiusAt(t);
-    disc(bx - 2, by + r * 0.5, r * 0.55, deep, 0.35, 4);
-  });
-  // Pale belly patches: small, irregular, hugging the lower edge only.
-  spine.forEach(([bx, by], i) => {
-    const t = i / (spine.length - 1);
-    if (t > 0.3 && t < 0.85 && i % 3 === 0 && rnd() < 0.75) {
-      disc(bx - 4, by + radiusAt(t) * 0.72, radiusAt(t) * (0.2 + rnd() * 0.1), hex('#fff3e0'), 0.38, 3);
-    }
-  });
-  // Moonlit rim along the back.
-  const rim: [number, number][] = spine.map(([bx, by], i) => {
-    const t = i / (spine.length - 1);
-    return [bx + 3, by - radiusAt(t) * 0.72];
-  });
-  stroke(rim, 3, hex('#ffe9a8'), 0.65);
-  // Scale arcs along the flank.
-  for (let i = 4; i < spine.length - 4; i += 3) {
-    const [bx, by] = spine[i];
-    const r = radiusAt(i / (spine.length - 1));
-    const a0 = 0.3 + rnd() * 0.4;
-    stroke(
-      quad([bx - r * 0.5, by - r * 0.1], [bx, by + r * 0.35], [bx + r * 0.5, by - r * 0.1], 8),
-      1.6,
-      hex('#ffd27a'),
-      0.4 + a0 * 0.3,
-    );
-  }
-
-  // Dorsal fin: narrow gold leaves sweeping back toward the tail.
-  for (let i = 8; i < spine.length - 8; i += 5) {
-    const [bx, by] = spine[i];
-    const r = radiusAt(i / (spine.length - 1));
-    leaf(bx, by - r * 0.6, bx - 20, by - r * 1.5, 7, hex('#ffc93c'), 0.9);
-  }
-  // Pectoral fin near the head.
-  const head = spine[spine.length - 1];
-  leaf(head[0] - 18, head[1] + 18, head[0] - 70, head[1] + 78, 14, hex('#ff9a2a'), 0.9);
-
-  // Head: slightly flattened disc, whiskers, eye.
-  disc(head[0], head[1], 34, orange, 1);
-  disc(head[0] + 8, head[1] - 6, 26, hex('#ff9a2a'), 0.9);
-  stroke(quad([head[0] + 26, head[1] + 6], [head[0] + 62, head[1] + 22], [head[0] + 96, head[1] + 52], 10), 2.2, hex('#ffd27a'), 0.9);
-  stroke(quad([head[0] + 24, head[1] + 12], [head[0] + 58, head[1] + 34], [head[0] + 88, head[1] + 70], 10), 2.2, hex('#ffd27a'), 0.9);
-  glow(head[0] + 12, head[1] - 8, 14, hex('#ffffff'), 0.9);
-  disc(head[0] + 12, head[1] - 8, 5, hex('#ffffff'), 1);
-  disc(head[0] + 13, head[1] - 8, 2.4, hex('#06283d'), 1);
-
-  // The splash: droplets burst from the leap point and turn into stars as they rise.
-  const leap: [number, number] = [290, 830];
-  for (let i = 0; i < 230; i++) {
-    const ang = -Math.PI * (0.15 + rnd() * 0.7);
-    const dist = 20 + rnd() * rnd() * 330;
-    const dx = leap[0] + Math.cos(ang) * dist + (rnd() - 0.5) * 26;
-    const dy = leap[1] + Math.sin(ang) * dist * 0.85 - rnd() * 30;
-    const h = clamp01((leap[1] - dy) / 320); // 0 at water, 1 high up
-    const r = 1 + rnd() * (3.4 - h * 1.6);
-    if (h > 0.55 && rnd() < 0.5) {
-      sparkle(dx, dy, r * 2.2, hex('#dff3ff'), 0.95);
-    } else {
-      disc(dx, dy, r, mix(hex('#7ad0ff'), hex('#dff3ff'), h), 0.9, 1);
-    }
-  }
-  // Splash crown: arcs of water around the leap point.
-  for (let a = 0; a < 7; a++) {
-    const ang = Math.PI * (1.05 + a * 0.13);
-    const rr = 46 + a * 16;
-    stroke(
-      quad(
-        [leap[0] + Math.cos(ang) * rr * 0.4, leap[1] - 8],
-        [leap[0] + Math.cos(ang) * rr * 0.8, leap[1] - 60 - a * 8],
-        [leap[0] + Math.cos(ang) * rr, leap[1] - 10],
-        10,
-      ),
-      3,
-      hex('#bfeaff'),
-      0.8,
-    );
-  }
-  // Ripples: concentric arcs on the water.
-  for (let r = 0; r < 5; r++) {
-    const rr = 60 + r * 42;
-    const pts: [number, number][] = [];
-    for (let a = Math.PI * 1.02; a <= Math.PI * 1.98; a += 0.08) {
-      pts.push([leap[0] + Math.cos(a) * rr, leap[1] + Math.sin(a) * rr * 0.32]);
-    }
-    stroke(pts, 2.5, hex('#9fd8ff'), 0.55 - r * 0.08);
-  }
-
-  // Motion streaks along the leap arc.
-  for (let i = 0; i < 26; i++) {
-    const t = rnd() * 0.8;
-    const [sx, sy] = spine[Math.floor(t * (spine.length - 1))];
-    const off = (rnd() - 0.5) * 90;
-    const len = 26 + rnd() * 60;
-    stroke(
-      [
-        [sx + off, sy + 40],
-        [sx + off * 0.7 + len * 0.4, sy + 40 - len],
-      ],
-      1.6,
-      hex('#9fd8ff'),
-      0.28,
-    );
-  }
-
-  // A word for the judge, in moonlight gold on the dark water.
-  const phrase = 'TO THE MOON';
-  const ts = 5;
-  const tw = textWidth(phrase, ts);
-  glow(512, 962, 200, hex('#ffd27a'), 0.12);
-  drawText(phrase, 512 - tw / 2, 944, ts, hex('#ffd27a'), 0.95);
+function drawSky(): void {
+  fillVerticalGradient([
+    { t: 0.0, c: [0.012, 0.016, 0.055] },
+    { t: 0.45, c: [0.03, 0.05, 0.14] },
+    { t: 0.68, c: [0.05, 0.10, 0.22] },
+    { t: 1.0, c: [0.03, 0.09, 0.19] },
+  ], 0, SH);
 }
 
-// --- entry point ----------------------------------------------------------------
-// The winning scene: a giant koi leaps for the moon.
-drawKoi();
+function drawStars(): void {
+  // Background stars, denser and brighter near the top.
+  for (let i = 0; i < 420; i++) {
+    const x = rand() * W, y = Math.pow(rand(), 1.4) * 660;
+    const r = 0.6 + rand() * 1.5;
+    const b = 0.35 + rand() * 0.65;
+    const tint: RGB = rand() < 0.25 ? [1, 0.9, 0.7] : [0.85, 0.9, 1];
+    disc(S(x), S(y), S(r), [tint[0] * b, tint[1] * b, tint[2] * b], 0.95, 1);
+    if (rand() < 0.12) {
+      // A few bright stars get a cross sparkle.
+      const l = S(r * 5);
+      thickLine([[S(x) - l, S(y)], [S(x) + l, S(y)]], S(0.7), [1, 1, 1], 0.5);
+      thickLine([[S(x), S(y) - l], [S(x), S(y) + l]], S(0.7), [1, 1, 1], 0.5);
+    }
+  }
+}
 
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, 'entry.png'), encodePNG(downsample(), W, H));
+function drawMoon(): void {
+  const mx = 752, my = 238, mr = 118;
+  // Wide halo, then a tighter inner glow, then the disc itself.
+  glow(S(mx), S(my), S(430), [0.55, 0.5, 0.28], 0.5);
+  glow(S(mx), S(my), S(230), [0.85, 0.8, 0.55], 0.65);
+  disc(S(mx), S(my), S(mr), [0.98, 0.94, 0.78], 1, 2.5);
+  // Pale gold maria: soft darker blotches on the face.
+  const maria: Array<[number, number, number, number]> = [
+    [712, 205, 34, 0.10], [790, 262, 26, 0.08], [726, 285, 20, 0.09],
+    [782, 198, 16, 0.07], [748, 232, 12, 0.06],
+  ];
+  for (const [x, y, r, a] of maria) disc(S(x), S(y), S(r), [0.78, 0.72, 0.55], a, 6);
+  // Bright rim on the upper-left edge, catching light.
+  for (let a = Math.PI * 0.75; a < Math.PI * 1.5; a += 0.01) {
+    const x = mx + Math.cos(a) * (mr - 4), y = my + Math.sin(a) * (mr - 4);
+    disc(S(x), S(y), S(2.5), [1, 0.99, 0.9], 0.4, 1.5);
+  }
+  // Thin bright ring just outside the disc.
+  for (let a = 0; a < Math.PI * 2; a += 0.01) {
+    const x = mx + Math.cos(a) * (mr + 5), y = my + Math.sin(a) * (mr + 5);
+    disc(S(x), S(y), S(1.4), [1, 0.97, 0.82], 0.35, 1);
+  }
+}
+
+function drawSea(): void {
+  // Deep water with a vertical gradient and a gold moon-reflection column.
+  for (let y = HORIZON * SS; y < SH; y++) {
+    const t = (y - HORIZON * SS) / (SH - HORIZON * SS);
+    const c = lerpStops([
+      { t: 0.0, c: [0.02, 0.07, 0.15] },
+      { t: 0.5, c: [0.012, 0.045, 0.11] },
+      { t: 1.0, c: [0.005, 0.02, 0.06] },
+    ], t);
+    for (let x = 0; x < SW; x++) setPx(x, y, c[0], c[1], c[2]);
+  }
+  // Moonlight column: shimmering gold dashes under the moon.
+  for (let i = 0; i < 90; i++) {
+    const y = HORIZON + 8 + rand() * 300;
+    const spread = 26 + (y - HORIZON) * 0.55;
+    const x = 752 + (rand() - 0.5) * 2 * spread;
+    const w = 14 + rand() * 60;
+    const bright = 0.25 + rand() * 0.5;
+    thickLine([[S(x - w / 2), S(y)], [S(x + w / 2), S(y)]], S(2.2 + rand() * 2),
+      [0.95 * bright, 0.8 * bright, 0.4 * bright], 0.55);
+  }
+  // Dark wave crests: thin pale arcs across the water.
+  for (let i = 0; i < 26; i++) {
+    const y = HORIZON + 12 + rand() * 300;
+    const x = rand() * W, w = 30 + rand() * 90;
+    thickLine([[S(x), S(y)], [S(x + w * 0.6), S(y - 3)], [S(x + w), S(y)]],
+      S(1.6), [0.35, 0.55, 0.75], 0.28);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The koi: a thick bezier spine, drawn as overlapping discs with a taper,
+// orange back, cream belly, black patches, fins, tail, eye and barbels.
+// ---------------------------------------------------------------------------
+function drawKoi(): void {
+  // Spine from tail (low left, still in the water) to head (high, near moon).
+  const p0: [number, number] = [168, 826];
+  const p1: [number, number] = [300, 730];
+  const p2: [number, number] = [500, 560];
+  const p3: [number, number] = [636, 412];
+  const N = 90;
+  const spine: Array<[number, number]> = [];
+  for (let i = 0; i <= N; i++) spine.push(bezier(p0, p1, p2, p3, i / N));
+  // Body width profile: slim and serpentine — narrow tail stalk, full middle,
+  // tapering sharply to a pointed head.
+  const widthAt = (t: number): number => {
+    const base = 15 + 58 * Math.sin(Math.PI * Math.pow(t, 0.75));
+    const headTaper = t > 0.86 ? 1 - (t - 0.86) * 4.5 : 1;
+    return base * (t < 0.12 ? 0.4 + t * 4 : 1) * Math.max(0.25, headTaper);
+  };
+  // Back (orange) — full body first.
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    const [x, y] = spine[i];
+    disc(S(x), S(y), S(widthAt(t)), [0.92, 0.42, 0.10], 1, 2);
+  }
+  // Cream belly: offset discs toward the lower side of the body.
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    if (t < 0.08 || t > 0.96) continue;
+    const [x, y] = spine[i];
+    const [nx, ny] = spine[Math.min(N, i + 2)];
+    const [px, py] = spine[Math.max(0, i - 2)];
+    const dx = nx - px, dy = ny - py, len = Math.hypot(dx, dy) || 1;
+    // Belly normal points down-right of the direction of travel.
+    const off = widthAt(t) * 0.34;
+    disc(S(x + (-dy / len) * off * 0.7 + 4), S(y + (dx / len) * off * 0.7 + 6),
+      S(widthAt(t) * 0.62), [0.98, 0.92, 0.78], 0.95, 3);
+  }
+  // Black patches on the back: small, irregular, unevenly spaced — two
+  // overlapping discs each, so none of them reads as a perfect polka dot.
+  const patches: Array<[number, number, number]> = [
+    [0.30, 0.16, 15], [0.45, -0.20, 18], [0.60, 0.14, 12], [0.74, -0.16, 16], [0.86, 0.04, 10],
+  ];
+  for (const [t, side, r] of patches) {
+    const i = Math.round(t * N);
+    const [x, y] = spine[i];
+    const [nx, ny] = spine[Math.min(N, i + 2)];
+    const [px, py] = spine[Math.max(0, i - 2)];
+    const dx = nx - px, dy = ny - py, len = Math.hypot(dx, dy) || 1;
+    const off = widthAt(t) * 0.40 * side;
+    const cx = x + (-dy / len) * off, cy = y + (dx / len) * off;
+    disc(S(cx), S(cy), S(r), [0.08, 0.06, 0.08], 0.95, 3);
+    disc(S(cx + r * 0.7), S(cy + r * 0.4), S(r * 0.6), [0.08, 0.06, 0.08], 0.95, 3);
+  }
+  // Dorsal fin: a dark orange ridge along the top of the body.
+  const finPts: Array<[number, number]> = [];
+  for (let i = 8; i <= 62; i += 2) {
+    const t = i / N;
+    const [x, y] = spine[i];
+    const [nx, ny] = spine[Math.min(N, i + 2)];
+    const [px, py] = spine[Math.max(0, i - 2)];
+    const dx = nx - px, dy = ny - py, len = Math.hypot(dx, dy) || 1;
+    const lift = widthAt(t) * (0.95 + 0.25 * Math.sin(t * 21));
+    finPts.push([x + (dy / len) * lift, y + (-dx / len) * lift]);
+  }
+  polygon(finPts.map(([x, y]) => [S(x), S(y)] as [number, number]),
+    [0.78, 0.28, 0.06], 0.95);
+  // Pectoral fin sweeping back from the mid-body.
+  const [hx, hy] = spine[N];
+  polygon([
+    [S(hx - 96), S(hy + 42)], [S(hx - 190), S(hy + 150)], [S(hx - 118), S(hy + 96)],
+  ], [0.95, 0.55, 0.22], 0.95);
+  // Tail: a big flowing fork, trailing down-left into the splash.
+  const [tx, ty] = spine[0];
+  polygon([
+    [S(tx + 22), S(ty - 26)], [S(tx - 30), S(ty - 118)], [S(tx - 74), S(ty - 44)],
+    [S(tx - 96), S(ty + 6)], [S(tx - 58), S(ty + 40)], [S(tx - 96), S(ty + 96)],
+    [S(tx - 20), S(ty + 58)],
+  ], [0.96, 0.62, 0.25], 0.97);
+  thickLine(
+    [[S(tx), S(ty)], [S(tx - 60), S(ty - 30)], [S(tx - 88), S(ty + 10)]],
+    S(10), [0.9, 0.4, 0.12], 0.6,
+  );
+  // Head details: eye seated ON the head just behind the snout tip, a small
+  // mouth at the tip, and two short barbels sweeping back from it.
+  disc(S(hx - 20), S(hy - 10), S(10), [0.98, 0.95, 0.85], 1, 2);
+  disc(S(hx - 18), S(hy - 11), S(5), [0.05, 0.04, 0.06], 1, 1.5);
+  disc(S(hx - 16), S(hy - 13), S(2), [1, 1, 1], 0.9, 1);
+  thickLine([[S(hx + 2), S(hy + 2)], [S(hx + 16), S(hy + 12)]], S(3.5), [0.7, 0.25, 0.05], 0.9);
+  thickLine([[S(hx + 2), S(hy + 8)], [S(hx + 18), S(hy + 30)]], S(3), [0.95, 0.6, 0.3], 0.85);
+  thickLine([[S(hx + 6), S(hy + 6)], [S(hx + 26), S(hy + 24)]], S(3), [0.95, 0.6, 0.3], 0.85);
+  // Motion streaks trailing the body: pale curved speed lines.
+  for (let k = 0; k < 7; k++) {
+    const t = 0.15 + k * 0.1;
+    const i = Math.round(t * N);
+    const [x, y] = spine[i];
+    const [nx, ny] = spine[Math.min(N, i + 3)];
+    const [px, py] = spine[Math.max(0, i - 3)];
+    const dx = nx - px, dy = ny - py, len = Math.hypot(dx, dy) || 1;
+    const off = widthAt(t) + 26 + k * 6;
+    const ax = x + (-dy / len) * off, ay = y + (dx / len) * off;
+    thickLine(
+      [[S(ax - dx * 0.55), S(ay - dy * 0.55)], [S(ax), S(ay)], [S(ax + dx * 0.35), S(ay + dy * 0.35)]],
+      S(3.5), [0.75, 0.9, 1], 0.5 - k * 0.04,
+    );
+  }
+  // Warm glow where the koi catches the moonlight.
+  glow(S(hx), S(hy), S(190), [0.9, 0.75, 0.4], 0.22);
+}
+
+// ---------------------------------------------------------------------------
+// Splash at the waterline: foam burst, droplets, droplets becoming stars.
+// ---------------------------------------------------------------------------
+function drawSplash(): void {
+  const sx = 168, sy = 712;
+  // Foam crown around the entry point.
+  for (let i = 0; i < 46; i++) {
+    const a = -Math.PI * (0.15 + rand() * 0.7);
+    const r = 26 + rand() * 110;
+    const x = sx + Math.cos(a) * r, y = sy + Math.sin(a) * r * 0.55;
+    const rr = 3 + rand() * 11;
+    disc(S(x), S(y), S(rr), [0.9, 0.96, 1], 0.55 + rand() * 0.4, 2);
+  }
+  // Droplets arcing upward along the koi's path toward the moon; the higher
+  // they fly, the more they look like stars. Bias the spray up-right so it
+  // follows the leap instead of fanning out to the left.
+  for (let i = 0; i < 110; i++) {
+    const t = rand();
+    const a = -(0.45 + rand() * 1.15); // -26 deg .. -92 deg: up and to the right
+    const dist = 60 + t * 460;
+    const x = sx + Math.cos(a) * dist;
+    const y = sy + Math.sin(a) * dist * 0.95 - t * 40;
+    if (y < 60 || x < 10 || x > 1014) continue;
+    const star = t > 0.45;
+    const r = star ? 2 + rand() * 2.5 : 2.5 + rand() * 4;
+    const bright = 0.6 + rand() * 0.4;
+    if (star) {
+      // Four-point star sparkle.
+      const l = S(r * 3.2);
+      thickLine([[S(x) - l, S(y)], [S(x) + l, S(y)]], S(1.4), [1, 0.95, 0.8], bright);
+      thickLine([[S(x), S(y) - l], [S(x), S(y) + l]], S(1.4), [1, 0.95, 0.8], bright);
+      disc(S(x), S(y), S(r), [1, 0.97, 0.85], bright, 1);
+    } else {
+      disc(S(x), S(y), S(r), [0.85, 0.93, 1], bright, 1.5);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Title: TO THE MOON in glowing gold across the dark water.
+// ---------------------------------------------------------------------------
+function drawTitle(): void {
+  const cx = 512, cy = 918, scale = 15;
+  const gold: RGB = [1, 0.78, 0.25];
+  // Wide soft halo first, then the crisp letters on top.
+  for (let pass = 0; pass < 3; pass++) {
+    drawText("TO THE MOON", cx, cy, scale + pass * 2.2, gold, 0.16);
+  }
+  drawText("TO THE MOON", cx, cy, scale, gold, 1);
+  drawText("TO THE MOON", cx, cy, scale, [1, 0.95, 0.7], 0.35);
+  // A thin gold underline shimmering on the water.
+  thickLine([[S(268), S(958)], [S(756), S(958)]], S(2.5), [1, 0.8, 0.3], 0.7);
+  thickLine([[S(330), S(968)], [S(694), S(968)]], S(1.8), [1, 0.85, 0.45], 0.45);
+}
+
+// ---------------------------------------------------------------------------
+// Main: paint the scene, encode, write the file.
+// ---------------------------------------------------------------------------
+function main(): void {
+  drawSky();
+  drawStars();
+  drawMoon();
+  drawSea();
+  drawKoi();
+  drawSplash();
+  drawTitle();
+  const rgb = downsample();
+  const png = encodePNG(rgb, W, H);
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(`${outDir}/entry.png`, png);
+  console.log(`wrote ${outDir}/entry.png (${png.length} bytes)`);
+}
+
+main();
